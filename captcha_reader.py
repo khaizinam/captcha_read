@@ -1,204 +1,301 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ứng dụng giải mã captcha và đọc ký tự từ hình ảnh
-Sử dụng OpenCV và Tesseract OCR
+Captcha OCR Reader Module
+Xử lý hình ảnh captcha và trích xuất text
 """
 
 import cv2
-import pytesseract
 import numpy as np
+import pytesseract
 from PIL import Image
-import argparse
 import os
-import sys
+import logging
+import gc
+
+# Cấu hình logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class CaptchaReader:
     def __init__(self):
-        """Khởi tạo CaptchaReader với cấu hình mặc định"""
-        # Cấu hình Tesseract (có thể cần điều chỉnh đường dẫn trên WSL)
-        self.tesseract_config = '--oem 3 --psm 6'
+        """Khởi tạo CaptchaReader"""
+        self.tesseract_config = os.getenv('TESSERACT_CONFIG', '--oem 3 --psm 6')
         
-    def preprocess_image(self, image_path):
+    def preprocess_image(self, image):
         """
         Tiền xử lý hình ảnh để cải thiện độ chính xác OCR
+        
+        Args:
+            image: Hình ảnh đầu vào (numpy array hoặc PIL Image)
+            
+        Returns:
+            numpy array: Hình ảnh đã được xử lý
         """
-        # Đọc hình ảnh
-        image = cv2.imread(image_path)
-        if image is None:
-            raise ValueError(f"Không thể đọc hình ảnh: {image_path}")
+        try:
+            # Chuyển đổi sang numpy array nếu cần
+            if isinstance(image, Image.Image):
+                image = np.array(image)
+            
+            # Chuyển đổi sang grayscale
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image.copy()
+            
+            # Resize ảnh để tăng độ phân giải (tối thiểu 300px height)
+            height, width = gray.shape
+            if height < 300:
+                scale = 300 / height
+                new_width = int(width * scale)
+                gray = cv2.resize(gray, (new_width, 300), interpolation=cv2.INTER_CUBIC)
+            
+            # Làm mờ nhẹ để giảm noise
+            blurred = cv2.GaussianBlur(gray, (1, 1), 0)
+            
+            # Thử nhiều phương pháp threshold khác nhau
+            methods = []
+            
+            # Method 1: OTSU
+            _, thresh1 = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            methods.append(thresh1)
+            
+            # Method 2: Adaptive threshold
+            thresh2 = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+            methods.append(thresh2)
+            
+            # Method 3: Manual threshold
+            _, thresh3 = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+            methods.append(thresh3)
+            
+            # Method 4: Invert colors (cho captcha có nền tối)
+            thresh4 = cv2.bitwise_not(thresh1)
+            methods.append(thresh4)
+            
+            # Chọn phương pháp tốt nhất (có thể cải thiện logic này)
+            # Tạm thời dùng OTSU
+            best_thresh = thresh1
+            
+            # Morphological operations để làm sạch
+            kernel = np.ones((1, 1), np.uint8)
+            cleaned = cv2.morphologyEx(best_thresh, cv2.MORPH_CLOSE, kernel)
+            
+            # Loại bỏ noise nhỏ
+            kernel = np.ones((2, 2), np.uint8)
+            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+            
+            return cleaned
+            
+        except Exception as e:
+            logger.error(f"Lỗi tiền xử lý hình ảnh: {e}")
+            return image
+    
+    def extract_text(self, image):
+        """
+        Trích xuất text từ hình ảnh captcha
         
-        # Chuyển đổi sang grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        Args:
+            image: Hình ảnh đầu vào
+            
+        Returns:
+            str: Text được trích xuất
+        """
+        try:
+            # Tiền xử lý hình ảnh
+            processed_image = self.preprocess_image(image)
+            
+            # Thử nhiều cấu hình Tesseract khác nhau
+            configs = [
+                '--oem 3 --psm 6',  # Single text line
+                '--oem 3 --psm 7',  # Single text word
+                '--oem 3 --psm 8',  # Single word
+                '--oem 3 --psm 13', # Raw line
+                '--oem 1 --psm 6',  # LSTM + Single text line
+                '--oem 1 --psm 7',  # LSTM + Single text word
+                '--oem 1 --psm 8',  # LSTM + Single word
+                '--oem 1 --psm 13', # LSTM + Raw line
+            ]
+            
+            best_text = ""
+            best_confidence = 0
+            
+            for config in configs:
+                try:
+                    # Trích xuất text với cấu hình hiện tại
+                    text = pytesseract.image_to_string(
+                        processed_image, 
+                        config=config
+                    ).strip()
+                    
+                    # Làm sạch text
+                    cleaned_text = self.clean_text(text)
+                    
+                    # Tính confidence (đơn giản: độ dài text hợp lý)
+                    if cleaned_text and 4 <= len(cleaned_text) <= 12:
+                        confidence = len(cleaned_text) / 10.0
+                        
+                        # Ưu tiên text có độ dài 6-10 ký tự
+                        if 6 <= len(cleaned_text) <= 10:
+                            confidence += 0.3
+                        
+                        if confidence > best_confidence:
+                            best_confidence = confidence
+                            best_text = cleaned_text
+                            
+                        logger.info(f"Config '{config}': '{cleaned_text}' (confidence: {confidence:.2f})")
+                    
+                except Exception as e:
+                    logger.warning(f"Lỗi với config '{config}': {e}")
+                    continue
+            
+            # Nếu không có kết quả tốt, thử với cấu hình mặc định
+            if not best_text:
+                try:
+                    text = pytesseract.image_to_string(
+                        processed_image, 
+                        config=self.tesseract_config
+                    ).strip()
+                    best_text = self.clean_text(text)
+                except:
+                    pass
+            
+            # Debug: Lưu ảnh đã xử lý để kiểm tra
+            try:
+                import os
+                debug_dir = "/app/logs/debug"
+                os.makedirs(debug_dir, exist_ok=True)
+                import time
+                timestamp = int(time.time() * 1000)
+                debug_path = f"{debug_dir}/processed_{timestamp}.png"
+                cv2.imwrite(debug_path, processed_image)
+                logger.info(f"Debug: Đã lưu ảnh xử lý tại {debug_path}")
+            except Exception as e:
+                logger.warning(f"Không thể lưu debug image: {e}")
+            
+            # Cleanup memory
+            gc.collect()
+            
+            logger.info(f"Text được trích xuất: '{best_text}' (confidence: {best_confidence:.2f})")
+            return best_text
+            
+        except Exception as e:
+            logger.error(f"Lỗi trích xuất text: {e}")
+            return ""
+    
+    def clean_text(self, text):
+        """
+        Làm sạch text được trích xuất
         
-        # Làm mờ để giảm nhiễu
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        Args:
+            text: Text thô từ OCR
+            
+        Returns:
+            str: Text đã được làm sạch
+        """
+        if not text:
+            return ""
         
-        # Threshold để tạo ảnh nhị phân
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Loại bỏ ký tự không mong muốn
+        cleaned = ''.join(c for c in text if c.isalnum())
         
-        # Loại bỏ nhiễu nhỏ
-        kernel = np.ones((2,2), np.uint8)
-        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        # Sửa các ký tự dễ nhầm lẫn
+        char_replacements = {
+            '0': 'O',  # Số 0 -> chữ O
+            '1': 'I',  # Số 1 -> chữ I
+            '5': 'S',  # Số 5 -> chữ S
+            '6': 'G',  # Số 6 -> chữ G
+            '8': 'B',  # Số 8 -> chữ B
+            '9': 'g',  # Số 9 -> chữ g
+        }
+        
+        # Thử thay thế các ký tự có thể nhầm lẫn
+        for digit, letter in char_replacements.items():
+            if digit in cleaned:
+                # Tạo version với thay thế
+                replaced = cleaned.replace(digit, letter)
+                # Nếu version thay thế có độ dài hợp lý hơn, dùng nó
+                if 6 <= len(replaced) <= 10 and len(replaced) >= len(cleaned):
+                    cleaned = replaced
+        
+        # Giới hạn độ dài (6-10 ký tự như yêu cầu)
+        if len(cleaned) > 10:
+            cleaned = cleaned[:10]
         
         return cleaned
     
-    def read_text_from_image(self, image_path, preprocess=True):
+    def process_captcha(self, image_path=None, image_data=None):
         """
-        Đọc text từ hình ảnh
+        Xử lý captcha từ file hoặc dữ liệu hình ảnh
         
         Args:
-            image_path (str): Đường dẫn đến hình ảnh
-            preprocess (bool): Có tiền xử lý hình ảnh hay không
+            image_path: Đường dẫn đến file hình ảnh
+            image_data: Dữ liệu hình ảnh (bytes)
             
         Returns:
-            str: Text được nhận dạng
-        """
-        try:
-            if preprocess:
-                # Tiền xử lý hình ảnh
-                processed_image = self.preprocess_image(image_path)
-            else:
-                # Đọc trực tiếp
-                processed_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-            
-            # Sử dụng Tesseract để OCR
-            text = pytesseract.image_to_string(
-                processed_image, 
-                config=self.tesseract_config,
-                lang='eng+vie'  # Hỗ trợ tiếng Anh và tiếng Việt
-            )
-            
-            return text.strip()
-            
-        except Exception as e:
-            print(f"Lỗi khi đọc hình ảnh {image_path}: {str(e)}")
-            return ""
-    
-    def read_captcha(self, image_path):
-        """
-        Chuyên biệt cho việc đọc captcha
+            dict: Kết quả xử lý
         """
         try:
             # Đọc hình ảnh
-            image = cv2.imread(image_path)
-            if image is None:
-                raise ValueError(f"Không thể đọc hình ảnh: {image_path}")
-            
-            # Resize nếu ảnh quá nhỏ
-            height, width = image.shape[:2]
-            if height < 50 or width < 100:
-                scale_factor = max(50/height, 100/width)
-                new_width = int(width * scale_factor)
-                new_height = int(height * scale_factor)
-                image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-            
-            # Chuyển sang grayscale
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            
-            # Tăng độ tương phản
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(gray)
-            
-            # Threshold
-            _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Loại bỏ nhiễu
-            kernel = np.ones((1,1), np.uint8)
-            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-            
-            # OCR với cấu hình tối ưu cho captcha
-            captcha_config = '--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-            text = pytesseract.image_to_string(cleaned, config=captcha_config)
-            
-            return text.strip()
-            
-        except Exception as e:
-            print(f"Lỗi khi đọc captcha {image_path}: {str(e)}")
-            return ""
-    
-    def batch_process(self, input_dir, output_file=None):
-        """
-        Xử lý hàng loạt các hình ảnh trong thư mục
-        
-        Args:
-            input_dir (str): Thư mục chứa hình ảnh
-            output_file (str): File để lưu kết quả (tùy chọn)
-        """
-        results = []
-        supported_formats = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif')
-        
-        if not os.path.exists(input_dir):
-            print(f"Thư mục không tồn tại: {input_dir}")
-            return
-        
-        for filename in os.listdir(input_dir):
-            if filename.lower().endswith(supported_formats):
-                image_path = os.path.join(input_dir, filename)
-                print(f"Đang xử lý: {filename}")
-                
-                # Thử đọc như captcha trước
-                text = self.read_captcha(image_path)
-                if not text:
-                    # Nếu không được, thử OCR thông thường
-                    text = self.read_text_from_image(image_path)
-                
-                result = {
-                    'file': filename,
-                    'text': text,
-                    'success': bool(text)
+            if image_path and os.path.exists(image_path):
+                image = Image.open(image_path)
+            elif image_data:
+                from io import BytesIO
+                image = Image.open(BytesIO(image_data))
+            else:
+                return {
+                    'success': False,
+                    'error': 'Không có dữ liệu hình ảnh'
                 }
-                results.append(result)
+            
+            # Trích xuất text
+            text = self.extract_text(image)
+            
+            if text:
+                return {
+                    'success': True,
+                    'text': text,
+                    'confidence': 0.8  # Có thể tính confidence thực tế
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': 'Không thể trích xuất text'
+                }
                 
-                print(f"Kết quả: {text}")
-                print("-" * 50)
-        
-        # Lưu kết quả
-        if output_file:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                for result in results:
-                    f.write(f"{result['file']}: {result['text']}\n")
-            print(f"Kết quả đã được lưu vào: {output_file}")
-        
-        return results
+        except Exception as e:
+            logger.error(f"Lỗi xử lý captcha: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
-def main():
-    parser = argparse.ArgumentParser(description='Ứng dụng giải mã captcha và OCR')
-    parser.add_argument('input', help='Đường dẫn đến hình ảnh hoặc thư mục')
-    parser.add_argument('-o', '--output', help='File output (cho batch processing)')
-    parser.add_argument('--captcha', action='store_true', help='Chế độ đọc captcha')
-    parser.add_argument('--no-preprocess', action='store_true', help='Không tiền xử lý hình ảnh')
+# Hàm tiện ích để sử dụng trực tiếp
+def read_captcha(image_path=None, image_data=None):
+    """
+    Hàm tiện ích để đọc captcha
     
-    args = parser.parse_args()
-    
-    # Khởi tạo reader
+    Args:
+        image_path: Đường dẫn đến file hình ảnh
+        image_data: Dữ liệu hình ảnh (bytes)
+        
+    Returns:
+        str: Text được trích xuất
+    """
     reader = CaptchaReader()
+    result = reader.process_captcha(image_path, image_data)
     
-    # Kiểm tra input là file hay thư mục
-    if os.path.isfile(args.input):
-        # Xử lý file đơn
-        print(f"Đang đọc: {args.input}")
-        
-        if args.captcha:
-            text = reader.read_captcha(args.input)
-        else:
-            text = reader.read_text_from_image(args.input, not args.no_preprocess)
-        
-        print(f"Kết quả: {text}")
-        
-    elif os.path.isdir(args.input):
-        # Xử lý hàng loạt
-        print(f"Đang xử lý thư mục: {args.input}")
-        results = reader.batch_process(args.input, args.output)
-        
-        # Thống kê
-        total = len(results)
-        success = sum(1 for r in results if r['success'])
-        print(f"\nThống kê: {success}/{total} hình ảnh được xử lý thành công")
-        
+    if result['success']:
+        return result['text']
     else:
-        print(f"Đường dẫn không hợp lệ: {args.input}")
-        sys.exit(1)
+        return ""
 
 if __name__ == "__main__":
-    main()
+    # Test với file hình ảnh
+    import sys
+    
+    if len(sys.argv) > 1:
+        image_path = sys.argv[1]
+        text = read_captcha(image_path=image_path)
+        print(f"Text được trích xuất: {text}")
+    else:
+        print("Sử dụng: python captcha_reader.py <đường_dẫn_hình_ảnh>")

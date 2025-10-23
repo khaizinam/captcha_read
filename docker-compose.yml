@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  captcha-ocr-api:
+    build: .
+    container_name: captcha-ocr-api
+    ports:
+      - "8086:5050"
+    environment:
+      - PORT=5050
+      - API_KEY=captcha_api_2024_secure_key_12345
+      - DEBUG=True
+      - HOST=0.0.0.0
+      - FLASK_ENV=development
+      - FLASK_DEBUG=True
+      - TESSERACT_CONFIG=--oem 3 --psm 6
+      - MAX_FILE_SIZE=10485760
+      - PYTHONHASHSEED=random
+      - MALLOC_ARENA_MAX=2
+    volumes:
+      - ./logs:/app/logs
+      - ./app.py:/app/app.py
+      - ./captcha_reader.py:/app/captcha_reader.py
+      - ./requirements.txt:/app/requirements.txt
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+          cpus: '2.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5050/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - captcha-network
+
+networks:
+  captcha-network:
+    driver: bridge
